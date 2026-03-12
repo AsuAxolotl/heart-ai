@@ -1,0 +1,238 @@
+# SETUP.md — Heart Materials AI
+
+A step-by-step guide to installing every tool and library required to run `app.py`.
+
+---
+
+## What the App Uses
+
+These are the external tools and libraries imported directly by the app:
+
+| Library / Tool | What it does in this app |
+|---|---|
+| **Ollama** | Runs the local LLM (`llama3.1:8b`) on your machine |
+| **LlamaIndex** | RAG framework — splits PDFs, builds the query engine |
+| **ChromaDB** | Vector database that stores document embeddings on disk |
+| **Sentence Transformers** | Embedding model (`all-MiniLM-L6-v2`) used to index PDFs |
+| **Streamlit** | Serves the chat UI in your browser |
+| **pandas** | Powers the materials knowledge base CSV ranking |
+
+---
+
+## Requirements
+
+- macOS (Apple Silicon recommended) or Windows
+- Python 3.12
+- ~5 GB of free disk space (for the LLM model)
+
+---
+
+## Step 1 — Install Python 3.12
+
+### macOS
+
+```bash
+# Install Homebrew if you don't have it
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Install Python 3.12
+brew install python@3.12
+```
+
+### Windows
+
+Download the installer from [python.org](https://www.python.org/downloads/release/python-3120/) and run it.
+
+> ⚠️ Check **"Add Python to PATH"** during installation before clicking Install.
+
+Verify either way:
+
+```bash
+python3 --version
+# Expected: Python 3.12.x
+```
+
+---
+
+## Step 2 — Clone the Repository
+
+```bash
+git clone https://github.com/YOUR_USERNAME/heart-materials-ai.git
+cd heart-materials-ai
+```
+
+---
+
+## Step 3 — Create a Virtual Environment
+
+This keeps the project's packages isolated from your system Python.
+
+```bash
+python3 -m venv venv
+
+# Activate — macOS/Linux
+source venv/bin/activate
+
+# Activate — Windows
+venv\Scripts\activate
+```
+
+You should see `(venv)` at the start of your terminal prompt.
+
+---
+
+## Step 4 — Install Python Dependencies
+
+Install all required libraries in one command:
+
+```bash
+pip install \
+  streamlit \
+  pandas \
+  chromadb \
+  llama-index-core \
+  llama-index-vector-stores-chroma \
+  llama-index-llms-ollama \
+  llama-index-embeddings-huggingface \
+  sentence-transformers
+```
+
+What each package maps to in `app.py`:
+
+| pip package | Import in app.py |
+|---|---|
+| `streamlit` | `import streamlit as st` |
+| `pandas` | `import pandas as pd` |
+| `chromadb` | `import chromadb` |
+| `llama-index-core` | `from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, ...` |
+| `llama-index-vector-stores-chroma` | `from llama_index.vector_stores.chroma import ChromaVectorStore` |
+| `llama-index-llms-ollama` | `from llama_index.llms.ollama import Ollama` |
+| `llama-index-embeddings-huggingface` | `from llama_index.embeddings.huggingface import HuggingFaceEmbedding` |
+| `sentence-transformers` | Used by HuggingFaceEmbedding to load `all-MiniLM-L6-v2` |
+
+Alternatively, if the repo has a `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Step 5 — Install Ollama
+
+Ollama runs the language model locally. No API key or internet connection is needed after setup.
+
+### macOS
+
+Download from [https://ollama.com/download](https://ollama.com/download) and run the `.dmg`, or install via Homebrew:
+
+```bash
+brew install ollama
+```
+
+### Windows
+
+Download and run the installer from [https://ollama.com/download](https://ollama.com/download).
+
+---
+
+## Step 6 — Download the LLM Model
+
+The app defaults to `llama3.1:8b`. Pull it with:
+
+```bash
+ollama pull llama3.1:8b
+```
+
+This is a one-time download (~4.7 GB). Once complete, verify it's available:
+
+```bash
+ollama list
+# llama3.1:8b should appear in the list
+```
+
+> **Want a different model?** You can type any model name from [ollama.com/library](https://ollama.com/library) into the "Ollama model name" field in the app sidebar — just make sure you've run `ollama pull <model-name>` first.
+
+---
+
+## Step 7 — Start Ollama
+
+Ollama needs to be running in the background before launching the app.
+
+### macOS
+If you installed via the `.dmg`, Ollama runs automatically. If not, start it manually:
+
+```bash
+ollama serve
+```
+
+### Windows
+Ollama starts automatically as a background service after installation.
+
+---
+
+## Step 8 — Run the App
+
+With your virtual environment active and Ollama running:
+
+```bash
+streamlit run app/app.py
+```
+
+Then open your browser to:
+
+```
+http://localhost:8501
+```
+
+---
+
+## Project Folder Structure
+
+The `data/`, `kb/`, and `chroma_db/` folders are created automatically on first run.
+
+```
+heart-materials-ai/
+│
+├── app/
+│   └── app.py
+│
+├── data/             ← your uploaded PDFs go here
+├── kb/               ← auto-generated materials CSVs
+├── chroma_db/        ← auto-generated vector index
+│
+├── requirements.txt
+└── SETUP.md
+```
+
+---
+
+## Troubleshooting
+
+**`ModuleNotFoundError: No module named 'llama_index'`**
+Your virtual environment is not active. Run `source venv/bin/activate` (macOS) or `venv\Scripts\activate` (Windows) before installing or running the app.
+
+**`Connection refused` when querying**
+Ollama is not running. Open a separate terminal and run `ollama serve`.
+
+**`model not found` error in the app**
+You haven't pulled the model yet. Run `ollama pull llama3.1:8b` (or whichever model name you entered in the sidebar).
+
+**Slow on first query**
+The first run downloads the `all-MiniLM-L6-v2` embedding model from HuggingFace automatically (~90 MB). This only happens once and is cached locally afterward.
+
+**ChromaDB errors after changing PDFs**
+Click **Build / Rebuild Index** in the sidebar to regenerate the vector database from scratch.
+
+---
+
+## Summary Checklist
+
+- [ ] Python 3.12 installed
+- [ ] Repository cloned
+- [ ] Virtual environment created and activated
+- [ ] Python packages installed via pip
+- [ ] Ollama installed
+- [ ] `llama3.1:8b` model pulled
+- [ ] Ollama running in the background
+- [ ] App launched with `streamlit run app/app.py`
