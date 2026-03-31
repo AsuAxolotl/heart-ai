@@ -4,9 +4,13 @@ import io
 import csv
 import json
 import hashlib
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import pandas as pd
 import streamlit as st
 
@@ -33,15 +37,66 @@ PERSIST_PATH = APP_ROOT / "chroma_db"
 PERSIST_DIR = str(PERSIST_PATH)
 COLLECTION_NAME = "heart_pdfs"
 INDEX_STATE_PATH = PERSIST_PATH / "index_state.json"
+DEFAULT_LLM_TIMEOUT_SECONDS = 900.0
+DEFAULT_SIMILARITY_TOP_K = 5
+NON_MATERIAL_TERMS = {
+    "the", "this", "that", "these", "those", "for", "from", "into", "with", "without",
+    "author", "authors", "author manuscript", "manuscript", "page", "han page", "pmc",
+    "figure", "fig", "table", "review", "abstract", "introduction", "discussion",
+    "results", "methods", "materials", "conclusion", "supplementary", "copyright",
+    "october", "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "november", "december", "compr physiol", "physiol",
+    "received", "accepted", "published", "preprint", "journal", "article",
+}
+MATERIAL_KEYWORDS = {
+    "poly", "gel", "hydrogel", "resin", "elastomer", "copolymer", "composite",
+    "acrylate", "methacrylate", "urethane", "siloxane", "silicone", "alginate",
+    "gelatin", "gelma", "collagen", "elastin", "fibrin", "chitosan", "cellulose",
+    "albumin", "bioink", "tcp", "hydroxyapatite", "ceramic",
+}
+PRINTER_TAG_ALIASES = {
+    "fdm/fff": "FDM",
+    "fff": "FDM",
+    "fdm": "FDM",
+    "sla/dlp": "Vat photopolymerization (SLA/DLP)",
+    "dlp/sla": "Vat photopolymerization (SLA/DLP)",
+    "sla": "SLA",
+    "dlp": "DLP",
+    "polyjet": "PolyJet",
+    "extrusion": "Extrusion / bioprinting",
+    "bioprinting": "Extrusion / bioprinting",
+    "3d printer": "General 3D printing",
+    "3d printers": "General 3D printing",
+    "3d printing": "General 3D printing",
+    "3d printing systems": "General 3D printing",
+    "photocrosslinking": "Photocrosslinking",
+    "photocrosslinkable": "Photocrosslinking",
+    "uv": "Photocrosslinking",
+}
+PRINTER_DESCRIPTIONS = {
+    "FDM": "Filament extrusion process commonly used for thermoplastics such as PLA, PCL, and PEEK.",
+    "SLA": "Laser-based vat photopolymerization process that cures liquid resin layer by layer with high detail.",
+    "DLP": "Projector-based vat photopolymerization process that cures entire resin layers at once.",
+    "Vat photopolymerization (SLA/DLP)": "Resin-based light-curing family that is useful for high-detail anatomical models and photocurable materials.",
+    "PolyJet": "Material-jetting process that deposits and UV-cures droplets of photopolymer for multi-material, high-detail prints.",
+    "Extrusion / bioprinting": "Nozzle-based deposition process used for hydrogels, bioinks, pastes, and other soft materials.",
+    "General 3D printing": "General corpus tag indicating 3D-printing knowledge without a single clearly specified printing modality.",
+    "Photocrosslinking": "Light-triggered curing workflow often paired with resin or hydrogel systems rather than a standalone printer family.",
+}
 
 KB_PATH = KB_DIR / "materials_kb.csv"
 MENTIONS_PATH = KB_DIR / "materials_mentions.csv"
 DISCOVERED_MATERIALS_PATH = KB_DIR / "discovered_materials.csv"
 CUSTOM_CONDITIONS_PATH = KB_DIR / "custom_conditions.json"
+FEEDBACK_DIR = APP_ROOT / "feedback"
+FEEDBACK_RAW_DIR = FEEDBACK_DIR / "raw"
+FEEDBACK_RULES_DIR = FEEDBACK_DIR / "rules"
 
 DATA_DIR.mkdir(exist_ok=True)
 KB_DIR.mkdir(exist_ok=True)
 PERSIST_PATH.mkdir(exist_ok=True)
+FEEDBACK_RAW_DIR.mkdir(parents=True, exist_ok=True)
+FEEDBACK_RULES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def list_pdf_files():
@@ -60,6 +115,102 @@ def get_pdf_inventory(pdf_files):
             }
         )
     return inventory
+
+
+def fetch_url_text(url: str, timeout: int = 60):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "heart-materials-ai/1.0 (local research tool)",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="ignore")
+
+
+def fetch_url_bytes(url: str, timeout: int = 120):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "heart-materials-ai/1.0 (local research tool)",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def search_pmc_articles(query: str, retmax: int = 5):
+    encoded_query = urllib.parse.quote_plus(query)
+    search_url = (
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        f"?db=pmc&term={encoded_query}&retmax={retmax}&retmode=json"
+    )
+    payload = json.loads(fetch_url_text(search_url))
+    id_list = payload.get("esearchresult", {}).get("idlist", [])
+    if not id_list:
+        return []
+
+    summary_url = (
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        f"?db=pmc&id={','.join(id_list)}&retmode=json"
+    )
+    summary_payload = json.loads(fetch_url_text(summary_url))
+    results = []
+    for pmc_numeric_id in id_list:
+        summary = summary_payload.get("result", {}).get(str(pmc_numeric_id), {})
+        if not summary:
+            continue
+        article_ids = summary.get("articleids", [])
+        pmcid = next(
+            (item.get("value") for item in article_ids if item.get("idtype") == "pmc"),
+            f"PMC{pmc_numeric_id}",
+        )
+        results.append(
+            {
+                "pmcid": pmcid if str(pmcid).startswith("PMC") else f"PMC{pmcid}",
+                "title": summary.get("title", ""),
+            }
+        )
+    return results
+
+
+def find_pmc_pdf_url(pmcid: str):
+    article_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
+    html = fetch_url_text(article_url)
+
+    meta_match = re.search(r'citation_pdf_url"\s+content="([^"]+)"', html, re.I)
+    if meta_match:
+        return html_unescape_url(meta_match.group(1))
+
+    href_match = re.search(r'href="([^"]+/pdf/[^"]+\.pdf[^"]*)"', html, re.I)
+    if href_match:
+        href = html_unescape_url(href_match.group(1))
+        if href.startswith("http"):
+            return href
+        return urllib.parse.urljoin(article_url, href)
+
+    fallback_match = re.search(r'href="([^"]+/pdf/[^"]*)"', html, re.I)
+    if fallback_match:
+        href = html_unescape_url(fallback_match.group(1))
+        if href.startswith("http"):
+            return href
+        return urllib.parse.urljoin(article_url, href)
+
+    raise ValueError(f"Could not find a downloadable PDF link for {pmcid}.")
+
+
+def html_unescape_url(url: str):
+    return url.replace("&amp;", "&").strip()
+
+
+def download_pmc_pdf(pmcid: str, title: str = ""):
+    pdf_url = find_pmc_pdf_url(pmcid)
+    pdf_bytes = fetch_url_bytes(pdf_url)
+    safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("_")
+    filename = f"{pmcid}_{safe_title[:80]}.pdf" if safe_title else f"{pmcid}.pdf"
+    destination = DATA_DIR / filename
+    destination.write_bytes(pdf_bytes)
+    return destination
 
 
 def compute_corpus_fingerprint(pdf_files):
@@ -112,6 +263,127 @@ def save_custom_conditions(state):
     CUSTOM_CONDITIONS_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+def split_feedback_segments(comment: str):
+    segments = []
+    for part in re.split(r"[.\n;]+", str(comment or "")):
+        cleaned = part.strip()
+        if cleaned:
+            segments.append(cleaned)
+    return segments[:5]
+
+
+def infer_feedback_themes(comment: str, query_route: str, answer_mode: str, score: int):
+    text = str(comment or "").lower()
+    themes = []
+    theme_keywords = {
+        "conciseness": ["too long", "verbose", "shorter", "concise", "brief"],
+        "evidence": ["source", "citation", "evidence", "support", "grounded"],
+        "clarity": ["clear", "confusing", "clarity", "understand", "organized", "structure"],
+        "accuracy": ["wrong", "incorrect", "accurate", "accuracy", "hallucinated"],
+        "speed": ["slow", "faster", "quick", "timeout", "lag"],
+        "inventory": ["inventory", "list", "catalog", "too many materials"],
+        "recommendation": ["recommend", "best", "alternative", "tradeoff"],
+        "avoidance": ["avoid", "risk", "warning", "unsafe"],
+        "extraction": ["parameter", "extract", "table", "not specified"],
+    }
+    for theme, keywords in theme_keywords.items():
+        if any(keyword in text for keyword in keywords):
+            themes.append(theme)
+
+    if not themes:
+        if answer_mode.startswith("Extract"):
+            themes.append("extraction")
+        elif query_route == "avoid":
+            themes.append("avoidance")
+        elif query_route == "recommend":
+            themes.append("recommendation")
+        else:
+            themes.append("general")
+
+    if score <= 2 and "accuracy" not in themes:
+        themes.append("accuracy")
+    return list(dict.fromkeys(themes))
+
+
+def build_feedback_rule_summary(score: int, themes, query_route: str, answer_mode: str, comment_segments):
+    route_label = "extract" if answer_mode.startswith("Extract") else query_route
+    if score >= 4:
+        if "evidence" in themes:
+            return f"Preserve the current {route_label} pattern of grounding answers in explicit evidence."
+        if "clarity" in themes:
+            return f"Preserve the current {route_label} structure because the answer format is working well."
+        return f"Keep the current {route_label} response style as a positive baseline."
+
+    rule_parts = []
+    if "conciseness" in themes:
+        rule_parts.append("Prioritize the top few findings before longer detail.")
+    if "evidence" in themes or "accuracy" in themes:
+        rule_parts.append("Make evidence support explicit before making claims.")
+    if "clarity" in themes:
+        rule_parts.append("Use clearer sectioning and simpler phrasing.")
+    if "inventory" in themes:
+        rule_parts.append("Cap inventory-style outputs and clean noisy entries before display.")
+    if "recommendation" in themes:
+        rule_parts.append("Surface tradeoffs and alternatives alongside the primary recommendation.")
+    if "avoidance" in themes:
+        rule_parts.append("State concrete risks and safer alternatives when advising against an option.")
+    if "extraction" in themes:
+        rule_parts.append("Prefer compact parameter tables and say not specified only when necessary.")
+    if not rule_parts and comment_segments:
+        rule_parts.append(comment_segments[0])
+    if not rule_parts:
+        rule_parts.append("Improve answer quality without changing the app's built-in rules.")
+    return " ".join(dict.fromkeys(rule_parts))
+
+
+def persist_feedback_artifacts(response_record: dict, score: int, comment: str):
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    fingerprint_source = f"{timestamp}|{response_record.get('question', '')}|{score}|{comment}"
+    feedback_id = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12]
+    comment_segments = split_feedback_segments(comment)
+    themes = infer_feedback_themes(
+        comment,
+        response_record.get("query_route", "default"),
+        response_record.get("mode", ""),
+        score,
+    )
+    rule_summary = build_feedback_rule_summary(
+        score,
+        themes,
+        response_record.get("query_route", "default"),
+        response_record.get("mode", ""),
+        comment_segments,
+    )
+
+    raw_feedback = {
+        "feedback_id": feedback_id,
+        "created_at": timestamp,
+        "score": score,
+        "comment": comment.strip(),
+        "comment_segments": comment_segments,
+        "response_record": response_record,
+    }
+    concise_rule = {
+        "rule_id": feedback_id,
+        "created_at": timestamp,
+        "advisory_only": True,
+        "source_feedback_id": feedback_id,
+        "query_route": response_record.get("query_route", "default"),
+        "mode": response_record.get("mode", ""),
+        "score": score,
+        "themes": themes,
+        "rule_summary": rule_summary,
+        "question_digest": str(response_record.get("question", ""))[:240],
+        "comment_digest": comment_segments[:3],
+    }
+
+    raw_path = FEEDBACK_RAW_DIR / f"{timestamp.replace(':', '-')}_{feedback_id}.json"
+    rule_path = FEEDBACK_RULES_DIR / f"{timestamp.replace(':', '-')}_{feedback_id}.json"
+    raw_path.write_text(json.dumps(raw_feedback, indent=2), encoding="utf-8")
+    rule_path.write_text(json.dumps(concise_rule, indent=2), encoding="utf-8")
+    return feedback_id, concise_rule
+
+
 def load_ranked_kb(printer: str, feel: str, priority):
     if not KB_PATH.exists():
         return pd.DataFrame()
@@ -121,7 +393,67 @@ def load_ranked_kb(printer: str, feel: str, priority):
         return pd.DataFrame()
     if kb_df.empty:
         return kb_df
+    if "material_groups" not in kb_df.columns:
+        kb_df = add_material_groups(kb_df)
     return kb_rank(kb_df, printer, feel, priority)
+
+
+def load_material_inventory():
+    if not KB_PATH.exists():
+        return pd.DataFrame()
+    try:
+        kb_df = pd.read_csv(KB_PATH)
+    except Exception:
+        return pd.DataFrame()
+    if kb_df.empty:
+        return kb_df
+    return kb_df.sort_values(["mentions", "material"], ascending=[False, True]).reset_index(drop=True)
+
+
+def load_printer_inventory():
+    if not KB_PATH.exists():
+        return pd.DataFrame(columns=["printer_system", "mentions", "materials", "files"])
+    try:
+        kb_df = pd.read_csv(KB_PATH)
+    except Exception:
+        return pd.DataFrame(columns=["printer_system", "mentions", "materials", "files"])
+    if kb_df.empty or "printers_tags" not in kb_df.columns:
+        return pd.DataFrame(columns=["printer_system", "mentions", "materials", "files"])
+
+    rows = []
+    for row in kb_df.itertuples():
+        printer_tags = split_material_tags(getattr(row, "printers_tags", ""))
+        files = str(getattr(row, "files", ""))
+        material = str(getattr(row, "material", ""))
+        mentions = int(getattr(row, "mentions", 0) or 0)
+        for printer_tag in printer_tags:
+            normalized_printer = normalize_printer_tag(printer_tag)
+            if not is_plausible_printer_tag(normalized_printer):
+                continue
+            rows.append(
+                {
+                    "printer_system": normalized_printer,
+                    "mentions": mentions,
+                    "material": material,
+                    "files": files,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["printer_system", "mentions", "materials", "files"])
+
+    printer_df = pd.DataFrame(rows)
+    aggregated = (
+        printer_df.groupby("printer_system", as_index=False)
+        .agg(
+            mentions=("mentions", "sum"),
+            materials=("material", join_unique),
+            files=("files", join_unique),
+        )
+        .sort_values(["mentions", "printer_system"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return aggregated
 
 
 def parse_custom_values(raw_value: str):
@@ -135,6 +467,223 @@ def merge_unique_values(*groups):
             if item not in merged:
                 merged.append(item)
     return merged
+
+
+def looks_like_recommendation_question(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+
+    recommendation_terms = [
+        "best", "better", "recommend", "recommended", "recommendation", "suitable",
+        "ideal", "good for", "use for", "should i use", "what should", "tradeoff",
+        "compare", "comparison", "pros and cons", "for an", "for a", "for the",
+    ]
+    return any(term in q for term in recommendation_terms)
+
+
+def looks_like_avoidance_question(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+
+    avoidance_terms = [
+        "avoid", "shouldn't use", "should not use", "not recommend", "would not recommend",
+        "unsafe", "bad for", "poor choice", "worst", "failure mode", "failure modes",
+        "what not to use", "what should i avoid", "risks", "downsides",
+    ]
+    return any(term in q for term in avoidance_terms)
+
+
+def classify_query_route(query: str) -> str:
+    if is_material_inventory_question(query):
+        return "material_inventory"
+    if is_printer_inventory_question(query):
+        return "printer_inventory"
+    if looks_like_avoidance_question(query):
+        return "avoid"
+    if looks_like_recommendation_question(query):
+        return "recommend"
+    return "default"
+
+
+def is_material_inventory_question(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    if looks_like_recommendation_question(q):
+        return False
+
+    material_terms = ["material", "materials"]
+    inventory_terms = ["inventory", "corpus", "knowledge", "know about", "available", "list", "show"]
+    inventory_phrases = [
+        "what materials",
+        "which materials",
+        "list materials",
+        "show materials",
+        "materials do you have",
+        "materials are in",
+        "what do you know about",
+        "what is in your corpus",
+        "what's in your corpus",
+        "inventory of materials",
+    ]
+    return any(phrase in q for phrase in inventory_phrases) or (
+        any(term in q for term in material_terms) and any(term in q for term in inventory_terms)
+    )
+
+
+def is_printer_inventory_question(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    if looks_like_recommendation_question(q):
+        return False
+
+    printer_terms = [
+        "printer",
+        "printers",
+        "printing system",
+        "printing systems",
+        "3d printing system",
+        "3d printing systems",
+        "printer types",
+        "print technologies",
+        "fabrication systems",
+        "machines",
+    ]
+    inventory_phrases = [
+        "what printers",
+        "which printers",
+        "what printing systems",
+        "which printing systems",
+        "what 3d printing systems",
+        "which 3d printing systems",
+        "what printer types",
+        "what print technologies",
+        "do you know about printers",
+        "knowledge of 3d printing systems",
+    ]
+    inventory_terms = ["inventory", "corpus", "knowledge", "know about", "available", "list", "show"]
+    return any(phrase in q for phrase in inventory_phrases) or (
+        any(term in q for term in printer_terms) and any(term in q for term in inventory_terms)
+    )
+
+
+def build_material_inventory_answer(material_inventory_df: pd.DataFrame, index_state, pdf_files):
+    if material_inventory_df.empty:
+        return (
+            "I do not have a built material inventory yet. Upload PDFs and rebuild the index first, "
+            "then I can answer inventory questions directly from the corpus."
+        )
+
+    material_names = material_inventory_df["material"].astype(str).tolist()
+    top_materials = material_inventory_df.head(12)
+    top_lines = [
+        f"- **{row.material}**: {int(row.mentions)} mentions across {len(str(row.files).split('; '))} source file(s)"
+        for row in top_materials.itertuples()
+    ]
+
+    remaining_count = max(len(material_names) - len(top_materials), 0)
+    remainder_line = (
+        f"\nThere are {remaining_count} additional materials in the indexed inventory beyond the top list above."
+        if remaining_count
+        else ""
+    )
+
+    return (
+        f"I currently have indexed knowledge of **{len(material_names)} materials** across **{len(pdf_files)} PDFs** "
+        f"and **{index_state.get('chunk_count', 0)} chunks**.\n\n"
+        f"Top materials by mentions:\n" + "\n".join(top_lines) +
+        f"\n\nFull inventory:\n{', '.join(material_names)}"
+        f"{remainder_line}"
+    )
+
+
+def build_printer_inventory_answer(printer_inventory_df: pd.DataFrame, index_state, pdf_files):
+    if printer_inventory_df.empty:
+        return (
+            "I do not have a built 3D-printing-system inventory yet. Upload PDFs and rebuild the index first, "
+            "then I can answer printer inventory questions directly from the corpus."
+        )
+
+    printer_names = printer_inventory_df["printer_system"].astype(str).tolist()
+    top_printers = printer_inventory_df.head(12)
+    top_lines = [
+        f"- **{row.printer_system}**: {describe_printer_system(row.printer_system)} "
+        f"Linked mentions: {int(row.mentions)} | example materials: {summarize_examples(row.materials)}"
+        for row in top_printers.itertuples()
+    ]
+
+    remaining_count = max(len(printer_names) - len(top_printers), 0)
+    remainder_line = (
+        f"\nThere are {remaining_count} additional printing systems in the indexed inventory beyond the top list above."
+        if remaining_count
+        else ""
+    )
+
+    return (
+        f"I currently have indexed knowledge of **{len(printer_names)} printing systems / printer tags** across "
+        f"**{len(pdf_files)} PDFs** and **{index_state.get('chunk_count', 0)} chunks**.\n\n"
+        f"Top printing systems by linked mentions:\n" + "\n".join(top_lines) +
+        f"\n\nFull printer inventory:\n{', '.join(printer_names)}"
+        f"{remainder_line}"
+    )
+
+
+def build_recommendation_prompt(query: str, kb_top: str) -> str:
+    return f"""
+You are a biomaterials recommendation assistant.
+
+Top candidate materials from local KB (use as hints; only cite if supported by retrieved text):
+{kb_top}
+
+User constraints:
+- Use-case: {use_case}
+- Printer type: {printer}
+- Target feel: {feel}
+- Priorities: {", ".join(priority)}
+
+User question:
+{query}
+
+Output requirements:
+1) Give a strong, specific answer. Use bullets and short sections.
+2) Ground claims in retrieved text. Cite sources as [S1], [S2], etc.
+3) Separate into:
+   A) Best options (ranked, with rationale + tradeoffs)
+   B) What to avoid / failure modes (if evidence exists)
+   C) Concrete next steps (what to test next, what knobs to tune)
+4) If something isn’t in the PDFs, say so plainly.
+"""
+
+
+def build_avoidance_prompt(query: str, kb_top: str) -> str:
+    return f"""
+You are a biomaterials risk-screening assistant.
+
+Top candidate materials from local KB (use as hints; only cite if supported by retrieved text):
+{kb_top}
+
+User constraints:
+- Use-case: {use_case}
+- Printer type: {printer}
+- Target feel: {feel}
+- Priorities: {", ".join(priority)}
+
+User question:
+{query}
+
+Output requirements:
+1) Focus first on what should be avoided or treated cautiously.
+2) Ground claims in retrieved text. Cite sources as [S1], [S2], etc.
+3) Separate into:
+   A) Materials/processes to avoid or treat cautiously
+   B) Why they are risky or mismatched
+   C) Safer alternatives or mitigation strategies supported by the PDFs
+   D) Evidence gaps or uncertainty
+4) If the PDFs do not support a strong warning, say that plainly.
+"""
 
 
 def curated_material_aliases():
@@ -196,6 +745,95 @@ def normalize_material_name(name: str) -> str:
     return token
 
 
+def normalize_printer_tag(tag: str) -> str:
+    token = re.sub(r"\s+", " ", str(tag or "").strip(" ,;:.()[]{}"))
+    if not token:
+        return ""
+
+    normalized = PRINTER_TAG_ALIASES.get(token.lower())
+    if normalized:
+        return normalized
+
+    if token.lower().startswith("3d print"):
+        return "General 3D printing"
+
+    return token
+
+
+def describe_printer_system(printer_system: str) -> str:
+    description = PRINTER_DESCRIPTIONS.get(str(printer_system or "").strip())
+    if description:
+        return description
+    return "Printing-related tag found in the indexed corpus."
+
+
+def is_plausible_printer_tag(tag: str) -> bool:
+    token = str(tag or "").strip()
+    if not token:
+        return False
+
+    token_lower = token.lower()
+    if token_lower in {"nan", "none", "null", "unknown"}:
+        return False
+
+    allowed_keywords = {
+        "fdm", "sla", "dlp", "polyjet", "extrusion", "bioprint", "photocrosslink",
+        "printing", "printer", "vat",
+    }
+    return any(keyword in token_lower for keyword in allowed_keywords)
+
+
+def summarize_examples(values: str, limit: int = 5) -> str:
+    examples = []
+    for value in split_material_tags(values):
+        normalized = normalize_material_name(value)
+        if not is_plausible_material_candidate(normalized):
+            continue
+        if normalized not in examples:
+            examples.append(normalized)
+        if len(examples) >= limit:
+            break
+    if not examples:
+        return "no clean material examples yet"
+    return ", ".join(examples)
+
+
+def is_plausible_material_candidate(token: str) -> bool:
+    if not token:
+        return False
+
+    token = str(token).strip()
+    token_lower = token.lower()
+
+    if token_lower in NON_MATERIAL_TERMS:
+        return False
+    if any(part in NON_MATERIAL_TERMS for part in token_lower.split()):
+        return False
+    if len(token) < 3:
+        return False
+    if len(token.split()) > 4:
+        return False
+
+    alias_values = {value.lower() for value in curated_material_aliases().values()}
+    alias_keys = set(curated_material_aliases().keys())
+    if token_lower in alias_keys or token_lower in alias_values:
+        return True
+
+    if token.isupper():
+        return bool(re.search(r"[-/\d]", token)) or token_lower in alias_values
+
+    if token_lower.startswith("poly"):
+        return True
+
+    if any(keyword in token_lower for keyword in MATERIAL_KEYWORDS):
+        return True
+
+    if re.search(r"[-/\d]", token) and any(ch.isalpha() for ch in token):
+        return True
+
+    return False
+
+
 def split_material_tags(value: str):
     if not value:
         return []
@@ -209,7 +847,7 @@ def discover_material_candidates(text: str, metadata_materials: str = ""):
 
     for token in split_material_tags(metadata_materials):
         normalized = normalize_material_name(token)
-        if normalized:
+        if is_plausible_material_candidate(normalized):
             candidates.add(normalized)
 
     alias_map = curated_material_aliases()
@@ -225,17 +863,12 @@ def discover_material_candidates(text: str, metadata_materials: str = ""):
         r"|[A-Za-z]+(?:[- ][A-Za-z]+){0,2}\s(?:hydrogel|resin|elastomer|copolymer|composite|acrylate|methacrylate)"
         r")\b"
     )
-    stopwords = {
-        "DNA", "RNA", "UV", "SLA", "DLP", "FDM", "LAP", "I2959", "TABLE", "FIG",
-        "REVIEW", "INTRODUCTION", "MATERIALS", "METHODS", "RESULTS", "DISCUSSION",
-        "PolyJet", "Extrusion", "Bioprinting", "Printer", "Temperature", "Exposure",
-    }
     generic_only = {"hydrogel", "resin", "bioink", "polymer", "copolymer", "composite", "elastomer"}
 
     for match in polymer_pattern.finditer(flat_text):
         token = normalize_material_name(match.group(1))
         token_lower = token.lower()
-        if not token or token in stopwords:
+        if not is_plausible_material_candidate(token):
             continue
         if token_lower in generic_only:
             continue
@@ -271,14 +904,190 @@ def top_snips(series, k=3):
     return " || ".join(snips)
 
 
+def infer_material_groups(material: str, printers_tags: str, settings_tags: str, materials_tags: str, example_snippets: str):
+    text = " ".join(
+        [
+            str(material or ""),
+            str(printers_tags or ""),
+            str(settings_tags or ""),
+            str(materials_tags or ""),
+            str(example_snippets or ""),
+        ]
+    ).lower()
+    material_lower = str(material or "").lower()
+    groups = []
+
+    flexible_markers = {
+        "pu", "peu", "pcu", "tpu", "silicone", "pdms", "elastomer", "flexible", "viscoelastic",
+        "compliant", "soft", "elastic",
+    }
+    rigid_markers = {
+        "pla", "peek", "ha", "β-tcp", "beta-tcp", "ceramic", "rigid", "stiff", "hard",
+        "polypropylene", "ptfe",
+    }
+    soft_hydrogel_markers = {
+        "gelma", "alginate", "collagen", "fibrin", "hydrogel", "bioink", "peg-da", "ha-ma",
+        "gelatin", "very soft",
+    }
+    photocurable_markers = {
+        "sla", "dlp", "photocrosslink", "uv", "resin", "methacrylate", "acrylate", "photoinitiator",
+        "peg-da", "gelma",
+    }
+    extrusion_markers = {
+        "extrusion", "bioprint", "nozzle", "viscosity", "bioink", "hydrogel",
+    }
+    fdm_markers = {
+        "fdm", "filament", "fff", "pla", "pcl", "peek", "plga", "pva",
+    }
+    composite_markers = {
+        "composite", "ha/", "/ha", "/tcp", "tcp", "fiber", "cf-", "ceramic",
+    }
+
+    if any(marker in text or marker == material_lower for marker in flexible_markers):
+        groups.append("flexible")
+    if any(marker in text or marker == material_lower for marker in rigid_markers):
+        groups.append("rigid")
+    if any(marker in text or marker == material_lower for marker in soft_hydrogel_markers):
+        groups.append("soft_compliant")
+    if any(marker in text for marker in photocurable_markers):
+        groups.append("photocurable")
+    if any(marker in text for marker in extrusion_markers):
+        groups.append("extrusion_compatible")
+    if any(marker in text for marker in fdm_markers):
+        groups.append("fdm_compatible")
+    if any(marker in text for marker in composite_markers):
+        groups.append("composite")
+
+    if not groups:
+        groups.append("general")
+    return "; ".join(dict.fromkeys(groups))
+
+
+def add_material_groups(agg_df: pd.DataFrame):
+    agg_columns = [
+        "material", "mentions", "files", "printers_tags", "settings_tags", "materials_tags",
+        "example_snippets", "material_groups"
+    ]
+    if agg_df.empty:
+        return pd.DataFrame(columns=agg_columns)
+
+    grouped = agg_df.copy()
+    grouped["material_groups"] = grouped.apply(
+        lambda row: infer_material_groups(
+            row.get("material", ""),
+            row.get("printers_tags", ""),
+            row.get("settings_tags", ""),
+            row.get("materials_tags", ""),
+            row.get("example_snippets", ""),
+        ),
+        axis=1,
+    )
+    return grouped[agg_columns]
+
+
+def select_grouped_candidates(materials_kb_df: pd.DataFrame, printer: str, feel: str):
+    if materials_kb_df.empty or "material_groups" not in materials_kb_df.columns:
+        return materials_kb_df
+
+    desired_groups = []
+    feel_lower = str(feel or "").lower()
+    printer_lower = str(printer or "").lower()
+
+    if "rigid" in feel_lower:
+        desired_groups.append("rigid")
+    elif "soft" in feel_lower or "compliant" in feel_lower:
+        desired_groups.extend(["soft_compliant", "flexible"])
+    elif "flexible" in feel_lower:
+        desired_groups.append("flexible")
+
+    if "sla" in printer_lower or "dlp" in printer_lower or "resin" in printer_lower:
+        desired_groups.append("photocurable")
+    elif "fdm" in printer_lower or "filament" in printer_lower:
+        desired_groups.append("fdm_compatible")
+    elif "hydrogel" in printer_lower or "bioprint" in printer_lower or "extrusion" in printer_lower:
+        desired_groups.append("extrusion_compatible")
+
+    desired_groups = list(dict.fromkeys(desired_groups))
+    if not desired_groups:
+        return materials_kb_df
+
+    filtered = materials_kb_df[
+        materials_kb_df["material_groups"].fillna("").apply(
+            lambda value: any(group in split_material_tags(str(value).replace("; ", ";")) for group in desired_groups)
+        )
+    ].copy()
+    return filtered if not filtered.empty else materials_kb_df
+
+
+def clean_tag_value(value: str, validator=None):
+    cleaned = []
+    for tag in split_material_tags(value):
+        normalized = re.sub(r"\s+", " ", str(tag).strip())
+        if not normalized:
+            continue
+        if validator and not validator(normalized):
+            continue
+        if normalized not in cleaned:
+            cleaned.append(normalized)
+    return "; ".join(cleaned)
+
+
+def clean_material_kb(raw_df: pd.DataFrame, agg_df: pd.DataFrame):
+    raw_columns = [
+        "material", "file", "printers_tags", "settings_tags", "materials_tags", "context_snippet"
+    ]
+    agg_columns = [
+        "material", "mentions", "files", "printers_tags", "settings_tags", "materials_tags",
+        "example_snippets", "material_groups"
+    ]
+
+    if raw_df.empty:
+        return pd.DataFrame(columns=raw_columns), pd.DataFrame(columns=agg_columns)
+
+    cleaned = raw_df.copy()
+    cleaned["material"] = cleaned["material"].apply(normalize_material_name)
+    cleaned = cleaned[cleaned["material"].apply(is_plausible_material_candidate)].copy()
+
+    generic_materials = {"hydrogel", "resin", "bioink", "polymer", "copolymer", "composite", "elastomer"}
+    cleaned = cleaned[~cleaned["material"].str.lower().isin(generic_materials)].copy()
+
+    cleaned["file"] = cleaned["file"].astype(str).str.strip()
+    cleaned["printers_tags"] = cleaned["printers_tags"].apply(clean_tag_value)
+    cleaned["settings_tags"] = cleaned["settings_tags"].apply(clean_tag_value)
+    cleaned["materials_tags"] = cleaned["materials_tags"].apply(
+        lambda value: clean_tag_value(
+            value,
+            validator=lambda token: is_plausible_material_candidate(normalize_material_name(token)),
+        )
+    )
+    cleaned["context_snippet"] = cleaned["context_snippet"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+
+    cleaned = cleaned.drop_duplicates(
+        subset=["material", "file", "context_snippet"]
+    ).reset_index(drop=True)
+
+    if cleaned.empty:
+        return pd.DataFrame(columns=raw_columns), pd.DataFrame(columns=agg_columns)
+
+    rebuilt_agg = cleaned.groupby("material", as_index=False).agg(
+        mentions=("material", "count"),
+        files=("file", lambda s: "; ".join(sorted(set(s.astype(str))))),
+        printers_tags=("printers_tags", join_unique),
+        settings_tags=("settings_tags", join_unique),
+        materials_tags=("materials_tags", join_unique),
+        example_snippets=("context_snippet", top_snips),
+    )
+    rebuilt_agg = rebuilt_agg.sort_values(["mentions", "material"], ascending=[False, True]).reset_index(drop=True)
+    rebuilt_agg = add_material_groups(rebuilt_agg)
+    return cleaned[raw_columns], rebuilt_agg[agg_columns]
+
+
 def extract_material_kb_rows(nodes):
     """
     Returns:
       raw_df: one row per mention
       agg_df: one row per material (consolidated)
     """
-    generic_materials = {"hydrogel", "resin", "bioink", "polymer", "copolymer", "composite", "elastomer"}
-
     rows = []
     for n in nodes:
         text = n.get_text() or ""
@@ -299,30 +1108,7 @@ def extract_material_kb_rows(nodes):
     raw_df = pd.DataFrame(rows, columns=[
         "material", "file", "printers_tags", "settings_tags", "materials_tags", "context_snippet"
     ])
-
-    if raw_df.empty:
-        agg_df = pd.DataFrame(columns=[
-            "material", "mentions", "files", "printers_tags", "settings_tags", "example_snippets"
-        ])
-        return raw_df, agg_df
-
-    raw_for_agg = raw_df[~raw_df["material"].str.lower().isin(generic_materials)].copy()
-    if raw_for_agg.empty:
-        agg_df = pd.DataFrame(columns=[
-            "material", "mentions", "files", "printers_tags", "settings_tags", "example_snippets"
-        ])
-        return raw_df, agg_df
-
-    agg = raw_for_agg.groupby("material", as_index=False).agg(
-        mentions=("material", "count"),
-        files=("file", lambda s: "; ".join(sorted(set(s.astype(str))))),
-        printers_tags=("printers_tags", join_unique),
-        settings_tags=("settings_tags", join_unique),
-        materials_tags=("materials_tags", join_unique),
-        example_snippets=("context_snippet", top_snips),
-    )
-    agg_df = agg.sort_values("mentions", ascending=False).reset_index(drop=True)
-    return raw_df, agg_df
+    return clean_material_kb(raw_df, pd.DataFrame())
 
 
 def kb_rank(materials_kb_df: pd.DataFrame, printer: str, feel: str, priority):
@@ -378,7 +1164,7 @@ def kb_rank(materials_kb_df: pd.DataFrame, printer: str, feel: str, priority):
 
         return s
 
-    df = materials_kb_df.copy()
+    df = select_grouped_candidates(materials_kb_df.copy(), printer, feel).copy()
     df["kb_score"] = df.apply(score_row, axis=1)
     return df.sort_values("kb_score", ascending=False)
 
@@ -447,9 +1233,12 @@ def build_index(_ollama_model: str, corpus_fingerprint: str, rebuild_version: in
 
         # Build/update KB CSVs (silent)
         raw_df, agg_df = extract_material_kb_rows(nodes)
+        raw_df, agg_df = clean_material_kb(raw_df, agg_df)
         raw_df.to_csv(MENTIONS_PATH, index=False)
         agg_df.to_csv(KB_PATH, index=False)
-        agg_df[["material", "mentions", "files", "materials_tags"]].to_csv(DISCOVERED_MATERIALS_PATH, index=False)
+        agg_df[["material", "mentions", "files", "materials_tags", "material_groups"]].to_csv(
+            DISCOVERED_MATERIALS_PATH, index=False
+        )
 
         index = VectorStoreIndex(nodes, storage_context=storage_context)
         save_index_state(
@@ -486,8 +1275,21 @@ st.caption(
 st.sidebar.header("Model (Ollama)")
 ollama_model = st.sidebar.text_input("Ollama model name", value="llama3.1:8b")
 st.sidebar.caption("Run `ollama list` to see installed models.")
+llm_timeout_seconds = st.sidebar.number_input(
+    "LLM timeout (seconds)",
+    min_value=60,
+    max_value=3600,
+    value=int(DEFAULT_LLM_TIMEOUT_SECONDS),
+    step=30,
+)
+retrieval_top_k = st.sidebar.slider(
+    "Retrieved chunks per answer",
+    min_value=2,
+    max_value=8,
+    value=DEFAULT_SIMILARITY_TOP_K,
+)
 
-llm = Ollama(model=ollama_model, request_timeout=360.0)
+llm = Ollama(model=ollama_model, request_timeout=float(llm_timeout_seconds))
 Settings.embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 Settings.llm = llm
 
@@ -589,6 +1391,43 @@ if uploads:
         (DATA_DIR / f.name).write_bytes(f.getbuffer())
     st.sidebar.success(f"Saved {len(uploads)} file(s) to ./data")
 
+st.sidebar.header("PubMed Central")
+pmc_query = st.sidebar.text_input(
+    "Search PMC for open-access papers",
+    placeholder="heart valve biomaterials 3D printing",
+)
+pmc_retmax = st.sidebar.slider("PMC papers to download", min_value=1, max_value=10, value=3)
+if st.sidebar.button("Search and download PMC PDFs"):
+    if not pmc_query.strip():
+        st.sidebar.warning("Enter a PubMed Central search query first.")
+    else:
+        try:
+            pmc_results = search_pmc_articles(pmc_query.strip(), retmax=pmc_retmax)
+            if not pmc_results:
+                st.sidebar.warning("No PubMed Central papers matched that query.")
+            else:
+                downloaded_files = []
+                failed_downloads = []
+                for result in pmc_results:
+                    try:
+                        downloaded_path = download_pmc_pdf(result["pmcid"], result.get("title", ""))
+                        downloaded_files.append(downloaded_path.name)
+                    except Exception as exc:
+                        failed_downloads.append(f"{result['pmcid']}: {exc}")
+
+                if downloaded_files:
+                    st.sidebar.success(f"Downloaded {len(downloaded_files)} PMC PDF(s) to ./data.")
+                    build_index.clear()
+                    with st.sidebar.expander("Downloaded PMC files"):
+                        for filename in downloaded_files:
+                            st.write(filename)
+                if failed_downloads:
+                    with st.sidebar.expander("PMC download issues"):
+                        for failure in failed_downloads:
+                            st.write(failure)
+        except Exception as exc:
+            st.sidebar.error(f"PMC download failed: {exc}")
+
 pdf_files = list_pdf_files()
 pdf_inventory = get_pdf_inventory(pdf_files)
 corpus_fingerprint = compute_corpus_fingerprint(pdf_files)
@@ -617,6 +1456,8 @@ else:
     st.sidebar.warning("The current PDFs do not match the saved index state yet.")
 
 ranked_kb = load_ranked_kb(printer, feel, priority)
+material_inventory_df = load_material_inventory()
+printer_inventory_df = load_printer_inventory()
 
 metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
 metric_col1.metric("PDFs", len(pdf_files))
@@ -635,14 +1476,19 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "last_sources" not in st.session_state:
     st.session_state.last_sources = []
+if "latest_response_record" not in st.session_state:
+    st.session_state.latest_response_record = None
+if "feedback_status" not in st.session_state:
+    st.session_state.feedback_status = ""
 
 chat_tab, corpus_tab = st.tabs(["Chat", "Corpus & KB"])
 
-def make_prompt(query: str) -> str:
+def make_prompt(query: str, query_route: str) -> str:
     # Pull KB hints silently (do NOT show them)
     kb_top = ""
     if not ranked_kb.empty:
-        kb_top = ranked_kb.head(8)[["material", "kb_score", "printers_tags", "settings_tags", "files", "mentions"]].to_csv(index=False)
+        prompt_columns = ["material", "kb_score", "material_groups", "printers_tags", "settings_tags", "files", "mentions"]
+        kb_top = ranked_kb.head(8)[prompt_columns].to_csv(index=False)
 
     if mode.startswith("Extract"):
         return f"""
@@ -667,31 +1513,11 @@ Rules:
 4) Output format EXACTLY:
 - Parameter | Value | Material/Context | Source #
 """
-    else:
-        return f"""
-You are a biomaterials recommendation assistant.
 
-Top candidate materials from local KB (use as hints; only cite if supported by retrieved text):
-{kb_top}
+    if query_route == "avoid":
+        return build_avoidance_prompt(query, kb_top)
 
-User constraints:
-- Use-case: {use_case}
-- Printer type: {printer}
-- Target feel: {feel}
-- Priorities: {", ".join(priority)}
-
-User question:
-{query}
-
-Output requirements:
-1) Give a strong, specific answer. Use bullets and short sections.
-2) Ground claims in retrieved text. Cite sources as [S1], [S2], etc.
-3) Separate into:
-   A) Best options (ranked, with rationale + tradeoffs)
-   B) What to avoid / failure modes (if evidence exists)
-   C) Concrete next steps (what to test next, what knobs to tune)
-4) If something isn’t in the PDFs, say so plainly.
-"""
+    return build_recommendation_prompt(query, kb_top)
 
 def collect_sources(response):
     sources = []
@@ -703,6 +1529,115 @@ def collect_sources(response):
             sources.append({"i": i, "file": filename, "snippet": snippet})
     return sources
 
+
+def build_terminal_failure_message(reason: str, query_route: str, llm_timeout_seconds: int, answer_mode: str) -> str:
+    if reason == "timeout":
+        return (
+            f"I couldn't complete this answer because the model timed out after {llm_timeout_seconds} seconds. "
+            "This is a terminal failure for the current run, so I am not returning a low-confidence guess. "
+            "Try a smaller model, fewer retrieved chunks, or a narrower question."
+        )
+
+    if reason == "insufficient_knowledge":
+        if answer_mode.startswith("Extract"):
+            route_hint = (
+                "The indexed PDFs do not appear to contain enough explicit parameter-level evidence to support a trustworthy extraction."
+            )
+        elif query_route in {"recommend", "avoid", "default"}:
+            route_hint = (
+                "The indexed PDFs do not appear to contain enough direct evidence to support a trustworthy recommendation."
+            )
+        else:
+            route_hint = "The indexed corpus does not contain enough direct evidence for a trustworthy answer."
+        return (
+            f"{route_hint} This is a terminal failure for the current query, so I am stopping instead of guessing. "
+            "Try uploading more relevant PDFs or asking a narrower evidence-backed question."
+        )
+
+    return "I couldn't produce a trustworthy answer for this query, so I am stopping instead of guessing."
+
+
+def response_has_sufficient_evidence(answer_text: str, sources, query_route: str, answer_mode: str) -> bool:
+    text = str(answer_text or "").strip().lower()
+    if not text:
+        return False
+
+    if query_route in {"material_inventory", "printer_inventory"}:
+        return True
+
+    if len(sources or []) == 0:
+        return False
+
+    general_insufficiency_markers = [
+        "i don't know",
+        "i do not know",
+        "not enough information",
+        "insufficient information",
+        "insufficient evidence",
+        "evidence is weak",
+        "cannot determine",
+        "can't determine",
+        "unable to determine",
+        "not in the pdfs",
+        "not in the retrieved text",
+        "no direct evidence",
+    ]
+    general_marker_hits = sum(marker in text for marker in general_insufficiency_markers)
+
+    if answer_mode.startswith("Extract"):
+        extraction_failure_markers = [
+            "no parameters found",
+            "no explicit parameters found",
+            "no extraction possible",
+        ]
+        if any(marker in text for marker in extraction_failure_markers):
+            return False
+        if general_marker_hits >= 2:
+            return False
+        if "|" not in answer_text and len(text) < 60:
+            return False
+        return True
+
+    if query_route == "avoid":
+        avoidance_markers = [
+            "no strong warning",
+            "no direct warning",
+            "no clear reason to avoid",
+        ]
+        if general_marker_hits >= 2 or all(marker in text for marker in avoidance_markers[:2]):
+            return False
+        return len(text) >= 100
+
+    if query_route in {"recommend", "default"}:
+        recommendation_markers = [
+            "not specified",
+            "unclear from the pdfs",
+            "weak evidence",
+        ]
+        marker_hits = general_marker_hits + sum(marker in text for marker in recommendation_markers)
+        if marker_hits >= 2:
+            return False
+        return len(text) >= 100
+
+    return len(text) >= 80
+
+
+def run_query_with_fallback(index, llm, prompt: str, retrieval_top_k: int):
+    primary_qe = index.as_query_engine(
+        llm=llm,
+        similarity_top_k=retrieval_top_k,
+        response_mode="compact",
+    )
+    try:
+        return primary_qe.query(prompt), False
+    except httpx.ReadTimeout:
+        fallback_qe = index.as_query_engine(
+            llm=llm,
+            similarity_top_k=max(2, min(3, retrieval_top_k)),
+            response_mode="simple_summarize",
+        )
+        return fallback_qe.query(prompt), True
+
 with chat_tab:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -711,9 +1646,11 @@ with chat_tab:
     user_msg = st.chat_input("Ask about materials, print settings, or what to avoid…")
 
     if user_msg:
+        st.session_state.feedback_status = ""
         st.session_state.messages.append({"role": "user", "content": user_msg})
         with st.chat_message("user"):
             st.markdown(user_msg)
+        query_route = classify_query_route(user_msg)
 
         if index is None:
             assistant_text = "No PDFs found yet. Upload PDFs in the sidebar, then click **Build / Rebuild Index**."
@@ -722,50 +1659,121 @@ with chat_tab:
                 st.markdown(assistant_text)
             st.stop()
 
-        qe = index.as_query_engine(llm=llm, similarity_top_k=8)
-
         with st.chat_message("assistant"):
-            with st.spinner("Searching your PDFs…"):
-                prompt = make_prompt(user_msg)
-                response = qe.query(prompt)
-
-                assistant_text = str(response)
+            if query_route == "material_inventory":
+                assistant_text = build_material_inventory_answer(material_inventory_df, index_state, pdf_files)
                 st.markdown(assistant_text)
+                inventory_sources = []
+                for i, row in enumerate(material_inventory_df.head(8).itertuples(), start=1):
+                    inventory_sources.append(
+                        {
+                            "i": i,
+                            "file": "materials_kb.csv",
+                            "snippet": f"{row.material}: {int(row.mentions)} mentions | files: {row.files}",
+                        }
+                    )
+                st.session_state.last_sources = inventory_sources
+            elif query_route == "printer_inventory":
+                assistant_text = build_printer_inventory_answer(printer_inventory_df, index_state, pdf_files)
+                st.markdown(assistant_text)
+                printer_sources = []
+                for i, row in enumerate(printer_inventory_df.head(8).itertuples(), start=1):
+                    printer_sources.append(
+                        {
+                            "i": i,
+                            "file": "materials_kb.csv",
+                            "snippet": (
+                                f"{row.printer_system}: {int(row.mentions)} linked mentions | "
+                                f"example materials: {summarize_examples(row.materials)}"
+                            ),
+                        }
+                    )
+                st.session_state.last_sources = printer_sources
+            else:
+                with st.spinner("Searching your PDFs…"):
+                    prompt = make_prompt(user_msg, query_route)
+                    try:
+                        response, used_timeout_fallback = run_query_with_fallback(index, llm, prompt, retrieval_top_k)
+                    except httpx.ReadTimeout:
+                        assistant_text = build_terminal_failure_message("timeout", query_route, llm_timeout_seconds, mode)
+                        st.error(assistant_text)
+                        st.session_state.last_sources = []
+                        st.session_state.messages.append({"role": "assistant", "content": assistant_text})
+                        st.stop()
 
-                sources = collect_sources(response)
-                st.session_state.last_sources = sources
+                    assistant_text = str(response)
+                    if used_timeout_fallback:
+                        st.caption("Used timeout fallback mode with fewer chunks to complete this answer.")
+                    sources = collect_sources(response)
+                    if not response_has_sufficient_evidence(assistant_text, sources, query_route, mode):
+                        assistant_text = build_terminal_failure_message(
+                            "insufficient_knowledge", query_route, llm_timeout_seconds, mode
+                        )
+                        st.warning(assistant_text)
+                        st.session_state.last_sources = sources
+                        st.session_state.messages.append({"role": "assistant", "content": assistant_text})
+                        st.stop()
 
-                if sources:
-                    with st.expander("Sources used (snippets)"):
-                        for s in sources:
-                            st.markdown(f"**[S{s['i']}] {s['file']}**")
-                            st.write(s["snippet"] + "…")
+                    st.markdown(assistant_text)
+                    st.session_state.last_sources = sources
 
-                timestamp = datetime.now().isoformat(timespec="seconds")
-                export = {
-                    "timestamp": timestamp,
-                    "mode": mode,
-                    "use_case": use_case,
-                    "printer_type": printer,
-                    "target_feel": feel,
-                    "priorities": "; ".join(priority),
-                    "question": user_msg,
-                    "answer": assistant_text,
-                    "sources": " || ".join([f"S{s['i']}|{s['file']}|{s['snippet']}" for s in sources]) if sources else "none",
-                }
-                csv_buf = io.StringIO()
-                writer = csv.DictWriter(csv_buf, fieldnames=list(export.keys()))
-                writer.writeheader()
-                writer.writerow(export)
+                    if sources:
+                        with st.expander("Sources used (snippets)"):
+                            for s in sources:
+                                st.markdown(f"**[S{s['i']}] {s['file']}**")
+                                st.write(s["snippet"] + "…")
 
-                st.download_button(
-                    "⬇️ Download this answer (CSV)",
-                    data=csv_buf.getvalue().encode("utf-8"),
-                    file_name=f"heart_materials_ai_{timestamp.replace(':','-')}.csv",
-                    mime="text/csv",
-                )
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            sources = st.session_state.last_sources
+            csv_buf = io.StringIO()
+            export = {
+                "timestamp": timestamp,
+                "mode": mode,
+                "query_route": query_route,
+                "use_case": use_case,
+                "printer_type": printer,
+                "target_feel": feel,
+                "priorities": "; ".join(priority),
+                "question": user_msg,
+                "answer": assistant_text,
+                "sources": " || ".join([f"S{s['i']}|{s['file']}|{s['snippet']}" for s in sources]) if sources else "none",
+            }
+            st.session_state.latest_response_record = export
+            writer = csv.DictWriter(csv_buf, fieldnames=list(export.keys()))
+            writer.writeheader()
+            writer.writerow(export)
+
+            st.download_button(
+                "⬇️ Download this answer (CSV)",
+                data=csv_buf.getvalue().encode("utf-8"),
+                file_name=f"heart_materials_ai_{timestamp.replace(':','-')}.csv",
+                mime="text/csv",
+            )
 
         st.session_state.messages.append({"role": "assistant", "content": assistant_text})
+
+    latest_response_record = st.session_state.get("latest_response_record")
+    if latest_response_record:
+        st.divider()
+        st.subheader("Response Feedback")
+        if st.session_state.feedback_status:
+            st.caption(st.session_state.feedback_status)
+
+        with st.form("response_feedback_form", clear_on_submit=False):
+            score = st.slider("Score this response", min_value=1, max_value=5, value=3)
+            comment = st.text_area(
+                "Comment on what should improve or stay the same",
+                placeholder="Example: Keep the evidence structure, but make the answer shorter and clearer.",
+            )
+            submitted = st.form_submit_button("Save feedback")
+
+        if submitted:
+            feedback_id, concise_rule = persist_feedback_artifacts(latest_response_record, score, comment)
+            st.session_state.feedback_status = (
+                f"Saved feedback {feedback_id}. Advisory rule stored separately with themes: "
+                f"{', '.join(concise_rule['themes'])}."
+            )
+            st.success(st.session_state.feedback_status)
 
 with corpus_tab:
     st.subheader("Corpus inventory")
@@ -780,7 +1788,7 @@ with corpus_tab:
     else:
         st.dataframe(
             ranked_kb[
-                ["material", "kb_score", "mentions", "files", "printers_tags", "settings_tags"]
+                ["material", "kb_score", "material_groups", "mentions", "files", "printers_tags", "settings_tags"]
             ].head(15),
             use_container_width=True,
             hide_index=True,
@@ -793,3 +1801,4 @@ with corpus_tab:
             st.write(s["snippet"] + "…")
     else:
         st.caption("Ask a question in the chat tab to populate the latest retrieval snippets.")
+
